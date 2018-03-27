@@ -3,17 +3,16 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <ctype.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
-#include <stdlib.h>
-#include <math.h>
 #include <float.h>
 
+#include "compiler/compiler.h"
 #include "parse.h"
 #include "debug.h"
+#include "log.h"
 #include "options.h"
 #include "optgroup.h"
 #include "minmax.h"
@@ -23,6 +22,22 @@
 #ifdef CONFIG_ARITHMETIC
 #include "y.tab.h"
 #endif
+
+static const char *opt_type_names[] = {
+	"OPT_INVALID",
+	"OPT_STR",
+	"OPT_STR_MULTI",
+	"OPT_STR_VAL",
+	"OPT_STR_VAL_TIME",
+	"OPT_STR_STORE",
+	"OPT_RANGE",
+	"OPT_INT",
+	"OPT_BOOL",
+	"OPT_FLOAT_LIST",
+	"OPT_STR_SET",
+	"OPT_DEPRECATED",
+	"OPT_UNSUPPORTED",
+};
 
 static struct fio_option *__fio_options;
 
@@ -135,6 +150,7 @@ static unsigned long long get_mult_time(const char *str, int len,
 	const char *p = str;
 	char *c;
 	unsigned long long mult = 1;
+	int i;
 
 	/*
          * Go forward until we hit a non-digit, or +/- sign
@@ -153,8 +169,8 @@ static unsigned long long get_mult_time(const char *str, int len,
 	}
 
 	c = strdup(p);
-	for (int i = 0; i < strlen(c); i++)
-		c[i] = tolower(c[i]);
+	for (i = 0; i < strlen(c); i++)
+		c[i] = tolower((unsigned char)c[i]);
 
 	if (!strncmp("us", c, 2) || !strncmp("usec", c, 4))
 		mult = 1;
@@ -167,7 +183,7 @@ static unsigned long long get_mult_time(const char *str, int len,
 	else if (!strcmp("h", c))
 		mult = 60 * 60 * 1000000UL;
 	else if (!strcmp("d", c))
-		mult = 24 * 60 * 60 * 1000000UL;
+		mult = 24 * 60 * 60 * 1000000ULL;
 
 	free(c);
 	return mult;
@@ -200,7 +216,7 @@ static unsigned long long __get_mult_bytes(const char *p, void *data,
 	c = strdup(p);
 
 	for (i = 0; i < strlen(c); i++) {
-		c[i] = tolower(c[i]);
+		c[i] = tolower((unsigned char)c[i]);
 		if (is_separator(c[i])) {
 			c[i] = '\0';
 			break;
@@ -468,6 +484,17 @@ static int str_match_len(const struct value_pair *vp, const char *str)
 			*ptr = (val);			\
 	} while (0)
 
+static const char *opt_type_name(struct fio_option *o)
+{
+	compiletime_assert(ARRAY_SIZE(opt_type_names) - 1 == FIO_OPT_UNSUPPORTED,
+				"opt_type_names[] index");
+
+	if (o->type <= FIO_OPT_UNSUPPORTED)
+		return opt_type_names[o->type];
+
+	return "OPT_UNKNOWN?";
+}
+
 static int __handle_option(struct fio_option *o, const char *ptr, void *data,
 			   int first, int more, int curr)
 {
@@ -482,8 +509,8 @@ static int __handle_option(struct fio_option *o, const char *ptr, void *data,
 	struct value_pair posval[PARSE_MAX_VP];
 	int i, all_skipped = 1;
 
-	dprint(FD_PARSE, "__handle_option=%s, type=%d, ptr=%s\n", o->name,
-							o->type, ptr);
+	dprint(FD_PARSE, "__handle_option=%s, type=%s, ptr=%s\n", o->name,
+							opt_type_name(o), ptr);
 
 	if (!ptr && o->type != FIO_OPT_STR_SET && o->type != FIO_OPT_STR) {
 		log_err("Option %s requires an argument\n", o->name);
@@ -555,8 +582,8 @@ static int __handle_option(struct fio_option *o, const char *ptr, void *data,
 			return 1;
 		}
 		if (o->minval && ull < o->minval) {
-			log_err("min value out of range: %llu"
-					" (%u min)\n", ull, o->minval);
+			log_err("min value out of range: %lld"
+					" (%d min)\n", ull, o->minval);
 			return 1;
 		}
 		if (o->posval[0].ival) {
@@ -1319,6 +1346,23 @@ void options_init(struct fio_option *options)
 	}
 }
 
+void options_mem_dupe(struct fio_option *options, void *data)
+{
+	struct fio_option *o;
+	char **ptr;
+
+	dprint(FD_PARSE, "dup options\n");
+
+	for (o = &options[0]; o->name; o++) {
+		if (o->type != FIO_OPT_STR_STORE)
+			continue;
+
+		ptr = td_var(data, o, o->off1);
+		if (*ptr)
+			*ptr = strdup(*ptr);
+	}
+}
+
 void options_free(struct fio_option *options, void *data)
 {
 	struct fio_option *o;
@@ -1327,7 +1371,7 @@ void options_free(struct fio_option *options, void *data)
 	dprint(FD_PARSE, "free options\n");
 
 	for (o = &options[0]; o->name; o++) {
-		if (o->type != FIO_OPT_STR_STORE || !o->off1)
+		if (o->type != FIO_OPT_STR_STORE || !o->off1 || o->no_free)
 			continue;
 
 		ptr = td_var(data, o, o->off1);

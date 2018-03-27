@@ -9,7 +9,6 @@
  * generic io engine that could be used for other projects.
  *
  */
-#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -52,14 +51,12 @@ static bool check_engine_ops(struct ioengine_ops *ops)
 void unregister_ioengine(struct ioengine_ops *ops)
 {
 	dprint(FD_IO, "ioengine %s unregistered\n", ops->name);
-	flist_del(&ops->list);
-	INIT_FLIST_HEAD(&ops->list);
+	flist_del_init(&ops->list);
 }
 
 void register_ioengine(struct ioengine_ops *ops)
 {
 	dprint(FD_IO, "ioengine %s registered\n", ops->name);
-	INIT_FLIST_HEAD(&ops->list);
 	flist_add_tail(&ops->list, &engine_list);
 }
 
@@ -123,12 +120,9 @@ static struct ioengine_ops *dlopen_ioengine(struct thread_data *td,
 	return ops;
 }
 
-struct ioengine_ops *load_ioengine(struct thread_data *td, const char *name)
+static struct ioengine_ops *__load_ioengine(const char *name)
 {
-	struct ioengine_ops *ops;
 	char engine[64];
-
-	dprint(FD_IO, "load ioengine %s\n", name);
 
 	engine[sizeof(engine) - 1] = '\0';
 	strncpy(engine, name, sizeof(engine) - 1);
@@ -136,13 +130,42 @@ struct ioengine_ops *load_ioengine(struct thread_data *td, const char *name)
 	/*
 	 * linux libaio has alias names, so convert to what we want
 	 */
-	if (!strncmp(engine, "linuxaio", 8) || !strncmp(engine, "aio", 3))
+	if (!strncmp(engine, "linuxaio", 8) || !strncmp(engine, "aio", 3)) {
+		dprint(FD_IO, "converting ioengine name: %s -> libaio\n", name);
 		strcpy(engine, "libaio");
+	}
 
-	ops = find_ioengine(engine);
+	dprint(FD_IO, "load ioengine %s\n", engine);
+	return find_ioengine(engine);
+}
+
+struct ioengine_ops *load_ioengine(struct thread_data *td)
+{
+	struct ioengine_ops *ops = NULL;
+	const char *name;
+
+	/*
+	 * Use ->ioengine_so_path if an external ioengine path is specified.
+	 * In this case, ->ioengine is "external" which also means the prefix
+	 * for external ioengines "external:" is properly used.
+	 */
+	name = td->o.ioengine_so_path ?: td->o.ioengine;
+
+	/*
+	 * Try to load ->ioengine first, and if failed try to dlopen(3) either
+	 * ->ioengine or ->ioengine_so_path.  This is redundant for an external
+	 * ioengine with prefix, and also leaves the possibility of unexpected
+	 * behavior (e.g. if the "external" ioengine exists), but we do this
+	 * so as not to break job files not using the prefix.
+	 */
+	ops = __load_ioengine(td->o.ioengine);
 	if (!ops)
 		ops = dlopen_ioengine(td, name);
 
+	/*
+	 * If ops is NULL, we failed to load ->ioengine, and also failed to
+	 * dlopen(3) either ->ioengine or ->ioengine_so_path as a path.
+	 */
 	if (!ops) {
 		log_err("fio: engine %s not loadable\n", name);
 		return NULL;
@@ -170,8 +193,10 @@ void free_ioengine(struct thread_data *td)
 		td->eo = NULL;
 	}
 
-	if (td->io_ops_dlhandle)
+	if (td->io_ops_dlhandle) {
 		dlclose(td->io_ops_dlhandle);
+		td->io_ops_dlhandle = NULL;
+	}
 
 	td->io_ops = NULL;
 }
@@ -198,7 +223,8 @@ int td_io_prep(struct thread_data *td, struct io_u *io_u)
 	if (td->io_ops->prep) {
 		int ret = td->io_ops->prep(td, io_u);
 
-		dprint(FD_IO, "->prep(%p)=%d\n", io_u, ret);
+		dprint(FD_IO, "prep: io_u %p: ret=%d\n", io_u, ret);
+
 		if (ret)
 			unlock_file(td, io_u->file);
 		return ret;
@@ -281,12 +307,14 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 		 */
 		if (td->o.read_iolog_file)
 			memcpy(&td->last_issue, &io_u->issue_time,
-					sizeof(struct timeval));
+					sizeof(io_u->issue_time));
 	}
 
 	if (ddir_rw(ddir)) {
-		td->io_issues[ddir]++;
-		td->io_issue_bytes[ddir] += buflen;
+		if (!(io_u->flags & IO_U_F_VER_LIST)) {
+			td->io_issues[ddir]++;
+			td->io_issue_bytes[ddir] += buflen;
+		}
 		td->rate_io_issue_bytes[ddir] += buflen;
 	}
 
@@ -318,8 +346,8 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 	    td->o.odirect) {
 
 		log_info("fio: first direct IO errored. File system may not "
-			 "support direct IO, or iomem_align= is bad. Try "
-			 "setting direct=0.\n");
+			 "support direct IO, or iomem_align= is bad, or "
+			 "invalid block size. Try setting direct=0.\n");
 	}
 
 	if (!td->io_ops->commit || io_u->ddir == DDIR_TRIM) {
@@ -328,7 +356,7 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 	}
 
 	if (ret == FIO_Q_COMPLETED) {
-		if (ddir_rw(io_u->ddir)) {
+		if (ddir_rw(io_u->ddir) || ddir_sync(io_u->ddir)) {
 			io_u_mark_depth(td, 1);
 			td->ts.total_io_u[io_u->ddir]++;
 		}
@@ -337,7 +365,7 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 
 		td->io_u_queued++;
 
-		if (ddir_rw(io_u->ddir))
+		if (ddir_rw(io_u->ddir) || ddir_sync(io_u->ddir))
 			td->ts.total_io_u[io_u->ddir]++;
 
 		if (td->io_u_queued >= td->o.iodepth_batch) {
@@ -356,7 +384,7 @@ int td_io_queue(struct thread_data *td, struct io_u *io_u)
 		 */
 		if (td->o.read_iolog_file)
 			memcpy(&td->last_issue, &io_u->issue_time,
-					sizeof(struct timeval));
+					sizeof(io_u->issue_time));
 	}
 
 	return ret;
@@ -368,16 +396,16 @@ int td_io_init(struct thread_data *td)
 
 	if (td->io_ops->init) {
 		ret = td->io_ops->init(td);
-		if (ret && td->o.iodepth > 1) {
-			log_err("fio: io engine init failed. Perhaps try"
-				" reducing io depth?\n");
-		}
+		if (ret)
+			log_err("fio: io engine %s init failed.%s\n",
+				td->io_ops->name,
+				td->o.iodepth > 1 ?
+				" Perhaps try reducing io depth?" : "");
+		else
+			td->io_ops_init = 1;
 		if (!td->error)
 			td->error = ret;
 	}
-
-	if (!ret && td_ioengine_flagged(td, FIO_NOIO))
-		td->flags |= TD_F_NOIO;
 
 	return ret;
 }
@@ -412,6 +440,7 @@ int td_io_open_file(struct thread_data *td, struct fio_file *f)
 {
 	assert(!fio_file_open(f));
 	assert(f->fd == -1);
+	assert(td->io_ops->open_file);
 
 	if (td->io_ops->open_file(td, f)) {
 		if (td->error == EINVAL && td->o.odirect)
@@ -449,7 +478,7 @@ int td_io_open_file(struct thread_data *td, struct fio_file *f)
 		goto err;
 
 	if (td->o.fadvise_hint != F_ADV_NONE &&
-	    (f->filetype == FIO_TYPE_BD || f->filetype == FIO_TYPE_FILE)) {
+	    (f->filetype == FIO_TYPE_BLOCK || f->filetype == FIO_TYPE_FILE)) {
 		int flags;
 
 		if (td->o.fadvise_hint == F_ADV_TYPE) {
@@ -468,42 +497,35 @@ int td_io_open_file(struct thread_data *td, struct fio_file *f)
 		}
 
 		if (posix_fadvise(f->fd, f->file_offset, f->io_size, flags) < 0) {
-			td_verror(td, errno, "fadvise");
-			goto err;
+			if (!fio_did_warn(FIO_WARN_FADVISE))
+				log_err("fio: fadvise hint failed\n");
 		}
 	}
-#ifdef FIO_HAVE_STREAMID
-	if (td->o.fadvise_stream &&
-	    (f->filetype == FIO_TYPE_BD || f->filetype == FIO_TYPE_FILE)) {
-		off_t stream = td->o.fadvise_stream;
+#ifdef FIO_HAVE_WRITE_HINT
+	if (fio_option_is_set(&td->o, write_hint) &&
+	    (f->filetype == FIO_TYPE_BLOCK || f->filetype == FIO_TYPE_FILE)) {
+		uint64_t hint = td->o.write_hint;
+		int cmd;
 
-		if (posix_fadvise(f->fd, stream, f->io_size, POSIX_FADV_STREAMID) < 0) {
-			td_verror(td, errno, "fadvise streamid");
-			goto err;
-		}
-	}
-#endif
+		/*
+		 * For direct IO, we just need/want to set the hint on
+		 * the file descriptor. For buffered IO, we need to set
+		 * it on the inode.
+		 */
+		if (td->o.odirect)
+			cmd = F_SET_FILE_RW_HINT;
+		else
+			cmd = F_SET_RW_HINT;
 
-#ifdef FIO_OS_DIRECTIO
-	/*
-	 * Some OS's have a distinct call to mark the file non-buffered,
-	 * instead of using O_DIRECT (Solaris)
-	 */
-	if (td->o.odirect) {
-		int ret = fio_set_odirect(f->fd);
-
-		if (ret) {
-			td_verror(td, ret, "fio_set_odirect");
-			if (ret == ENOTTY) { /* ENOTTY suggests RAW device or ZFS */
-				log_err("fio: doing directIO to RAW devices or ZFS not supported\n");
-			} else {
-				log_err("fio: the file system does not seem to support direct IO\n");
-			}
-
+		if (fcntl(f->fd, cmd, &hint) < 0) {
+			td_verror(td, errno, "fcntl write hint");
 			goto err;
 		}
 	}
 #endif
+
+	if (td->o.odirect && !OS_O_DIRECT && fio_set_directio(td, f))
+		goto err;
 
 done:
 	log_file(td, f, FIO_LOG_OPEN_FILE);
@@ -556,77 +578,18 @@ int td_io_get_file_size(struct thread_data *td, struct fio_file *f)
 	return td->io_ops->get_file_size(td, f);
 }
 
-static int do_sync_file_range(const struct thread_data *td,
-			      struct fio_file *f)
-{
-	off64_t offset, nbytes;
-
-	offset = f->first_write;
-	nbytes = f->last_write - f->first_write;
-
-	if (!nbytes)
-		return 0;
-
-	return sync_file_range(f->fd, offset, nbytes, td->o.sync_file_range);
-}
-
-int do_io_u_sync(const struct thread_data *td, struct io_u *io_u)
-{
-	int ret;
-
-	if (io_u->ddir == DDIR_SYNC) {
-		ret = fsync(io_u->file->fd);
-	} else if (io_u->ddir == DDIR_DATASYNC) {
-#ifdef CONFIG_FDATASYNC
-		ret = fdatasync(io_u->file->fd);
-#else
-		ret = io_u->xfer_buflen;
-		io_u->error = EINVAL;
-#endif
-	} else if (io_u->ddir == DDIR_SYNC_FILE_RANGE)
-		ret = do_sync_file_range(td, io_u->file);
-	else {
-		ret = io_u->xfer_buflen;
-		io_u->error = EINVAL;
-	}
-
-	if (ret < 0)
-		io_u->error = errno;
-
-	return ret;
-}
-
-int do_io_u_trim(const struct thread_data *td, struct io_u *io_u)
-{
-#ifndef FIO_HAVE_TRIM
-	io_u->error = EINVAL;
-	return 0;
-#else
-	struct fio_file *f = io_u->file;
-	int ret;
-
-	ret = os_trim(f->fd, io_u->offset, io_u->xfer_buflen);
-	if (!ret)
-		return io_u->xfer_buflen;
-
-	io_u->error = ret;
-	return 0;
-#endif
-}
-
 int fio_show_ioengine_help(const char *engine)
 {
 	struct flist_head *entry;
-	struct thread_data td;
+	struct ioengine_ops *io_ops;
 	char *sep;
 	int ret = 1;
 
 	if (!engine || !*engine) {
 		log_info("Available IO engines:\n");
 		flist_for_each(entry, &engine_list) {
-			td.io_ops = flist_entry(entry, struct ioengine_ops,
-						list);
-			log_info("\t%s\n", td.io_ops->name);
+			io_ops = flist_entry(entry, struct ioengine_ops, list);
+			log_info("\t%s\n", io_ops->name);
 		}
 		return 0;
 	}
@@ -636,20 +599,16 @@ int fio_show_ioengine_help(const char *engine)
 		sep++;
 	}
 
-	memset(&td, 0, sizeof(td));
-
-	td.io_ops = load_ioengine(&td, engine);
-	if (!td.io_ops) {
+	io_ops = __load_ioengine(engine);
+	if (!io_ops) {
 		log_info("IO engine %s not found\n", engine);
 		return 1;
 	}
 
-	if (td.io_ops->options)
-		ret = show_cmd_help(td.io_ops->options, sep);
+	if (io_ops->options)
+		ret = show_cmd_help(io_ops->options, sep);
 	else
-		log_info("IO engine %s has no options\n", td.io_ops->name);
-
-	free_ioengine(&td);
+		log_info("IO engine %s has no options\n", io_ops->name);
 
 	return ret;
 }

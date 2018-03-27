@@ -2,6 +2,7 @@
 #define FIO_VERIFY_H
 
 #include <stdint.h>
+#include "compiler/compiler.h"
 #include "verify-state.h"
 
 #define FIO_HDR_MAGIC	0xacca
@@ -15,12 +16,15 @@ enum {
 	VERIFY_CRC64,			/* crc64 sum data blocks */
 	VERIFY_CRC32,			/* crc32 sum data blocks */
 	VERIFY_CRC32C,			/* crc32c sum data blocks */
-	VERIFY_CRC32C_ARM64,		/* crc32c sum data blocks with hw */
 	VERIFY_CRC32C_INTEL,		/* crc32c sum data blocks with hw */
 	VERIFY_CRC16,			/* crc16 sum data blocks */
 	VERIFY_CRC7,			/* crc7 sum data blocks */
 	VERIFY_SHA256,			/* sha256 sum data blocks */
 	VERIFY_SHA512,			/* sha512 sum data blocks */
+	VERIFY_SHA3_224,		/* sha3-224 sum data blocks */
+	VERIFY_SHA3_256,		/* sha3-256 sum data blocks */
+	VERIFY_SHA3_384,		/* sha3-384 sum data blocks */
+	VERIFY_SHA3_512,		/* sha3-512 sum data blocks */
 	VERIFY_XXHASH,			/* xxhash sum data blocks */
 	VERIFY_SHA1,			/* sha1 sum data blocks */
 	VERIFY_PATTERN,			/* verify specific patterns */
@@ -40,7 +44,7 @@ struct verify_header {
 	uint64_t rand_seed;
 	uint64_t offset;
 	uint32_t time_sec;
-	uint32_t time_usec;
+	uint32_t time_nsec;
 	uint16_t thread;
 	uint16_t numberio;
 	uint32_t crc32;
@@ -48,6 +52,18 @@ struct verify_header {
 
 struct vhdr_md5 {
 	uint32_t md5_digest[4];
+};
+struct vhdr_sha3_224 {
+	uint8_t sha[224 / 8];
+};
+struct vhdr_sha3_256 {
+	uint8_t sha[256 / 8];
+};
+struct vhdr_sha3_384 {
+	uint8_t sha[384 / 8];
+};
+struct vhdr_sha3_512 {
+	uint8_t sha[512 / 8];
 };
 struct vhdr_sha512 {
 	uint8_t sha512[128];

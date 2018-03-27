@@ -9,9 +9,6 @@
 
 #include "../fio.h"
 #include "../optgroup.h"
-#ifdef CONFIG_RBD_BLKIN
-#include <zipkin_c.h>
-#endif
 
 #ifdef CONFIG_RBD_POLL
 /* add for poll */
@@ -24,9 +21,6 @@ struct fio_rbd_iou {
 	rbd_completion_t completion;
 	int io_seen;
 	int io_complete;
-#ifdef CONFIG_RBD_BLKIN
-	struct blkin_trace_info info;
-#endif
 };
 
 struct rbd_data {
@@ -146,7 +140,7 @@ static bool _fio_rbd_setup_poll(struct rbd_data *rbd)
 	int r;
 
 	/* add for rbd poll */
-	rbd->fd = eventfd(0, EFD_NONBLOCK);
+	rbd->fd = eventfd(0, EFD_SEMAPHORE);
 	if (rbd->fd < 0) {
 		log_err("eventfd failed.\n");
 		return false;
@@ -290,7 +284,7 @@ static void _fio_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 	 */
 	ret = rbd_aio_get_return_value(fri->completion);
 	if (ret < 0) {
-		io_u->error = ret;
+		io_u->error = -ret;
 		io_u->resid = io_u->xfer_buflen;
 	} else
 		io_u->error = 0;
@@ -366,25 +360,37 @@ static int rbd_iter_events(struct thread_data *td, unsigned int *events,
 	int event_num = 0;
 	struct fio_rbd_iou *fri = NULL;
 	rbd_completion_t comps[min_evts];
+	uint64_t counter;
+	bool completed;
 
 	struct pollfd pfd;
 	pfd.fd = rbd->fd;
 	pfd.events = POLLIN;
 
-	ret = poll(&pfd, 1, -1);
+	ret = poll(&pfd, 1, wait ? -1 : 0);
 	if (ret <= 0)
 		return 0;
-
-	assert(pfd.revents & POLLIN);
+	if (!(pfd.revents & POLLIN))
+		return 0;
 
 	event_num = rbd_poll_io_events(rbd->image, comps, min_evts);
 
 	for (i = 0; i < event_num; i++) {
 		fri = rbd_aio_get_arg(comps[i]);
 		io_u = fri->io_u;
+
+		/* best effort to decrement the semaphore */
+		ret = read(rbd->fd, &counter, sizeof(counter));
+		if (ret <= 0)
+			log_err("rbd_iter_events failed to decrement semaphore.\n");
+
+		completed = fri_check_complete(rbd, io_u, events);
+		assert(completed);
+
+		this_events++;
+	}
 #else
 	io_u_qiter(&td->io_u_all, io_u, i) {
-#endif
 		if (!(io_u->flags & IO_U_F_FLIGHT))
 			continue;
 		if (rbd_io_u_seen(io_u))
@@ -395,6 +401,7 @@ static int rbd_iter_events(struct thread_data *td, unsigned int *events,
 		else if (wait)
 			rbd->sort_events[sidx++] = io_u;
 	}
+#endif
 
 	if (!wait || !sidx)
 		return this_events;
@@ -474,28 +481,16 @@ static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 	}
 
 	if (io_u->ddir == DDIR_WRITE) {
-#ifdef CONFIG_RBD_BLKIN
-		blkin_init_trace_info(&fri->info);
-		r = rbd_aio_write_traced(rbd->image, io_u->offset, io_u->xfer_buflen,
-					 io_u->xfer_buf, fri->completion, &fri->info);
-#else
 		r = rbd_aio_write(rbd->image, io_u->offset, io_u->xfer_buflen,
 					 io_u->xfer_buf, fri->completion);
-#endif
 		if (r < 0) {
 			log_err("rbd_aio_write failed.\n");
 			goto failed_comp;
 		}
 
 	} else if (io_u->ddir == DDIR_READ) {
-#ifdef CONFIG_RBD_BLKIN
-		blkin_init_trace_info(&fri->info);
-		r = rbd_aio_read_traced(rbd->image, io_u->offset, io_u->xfer_buflen,
-					io_u->xfer_buf, fri->completion, &fri->info);
-#else
 		r = rbd_aio_read(rbd->image, io_u->offset, io_u->xfer_buflen,
 					io_u->xfer_buf, fri->completion);
-#endif
 
 		if (r < 0) {
 			log_err("rbd_aio_read failed.\n");
@@ -517,6 +512,7 @@ static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 	} else {
 		dprint(FD_IO, "%s: Warning: unhandled ddir: %d\n", __func__,
 		       io_u->ddir);
+		r = -EINVAL;
 		goto failed_comp;
 	}
 
@@ -524,7 +520,7 @@ static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 failed_comp:
 	rbd_aio_release(fri->completion);
 failed:
-	io_u->error = r;
+	io_u->error = -r;
 	td_verror(td, io_u->error, "xfer");
 	return FIO_Q_COMPLETED;
 }
@@ -566,12 +562,7 @@ static int fio_rbd_setup(struct thread_data *td)
 	rbd_image_info_t info;
 	struct fio_file *f;
 	struct rbd_data *rbd = NULL;
-	int major, minor, extra;
 	int r;
-
-	/* log version of librbd. No cluster connection required. */
-	rbd_version(&major, &minor, &extra);
-	log_info("rbd engine: RBD version: %d.%d.%d\n", major, minor, extra);
 
 	/* allocate engine specific structure to deal with librbd. */
 	r = _fio_setup_rbd_data(td, &rbd);
@@ -602,14 +593,14 @@ static int fio_rbd_setup(struct thread_data *td)
 	r = rbd_stat(rbd->image, &info, sizeof(info));
 	if (r < 0) {
 		log_err("rbd_status failed.\n");
-		goto disconnect;
+		goto cleanup;
 	} else if (info.size == 0) {
 		log_err("image size should be larger than zero.\n");
 		r = -EINVAL;
-		goto disconnect;
+		goto cleanup;
 	}
 
-	dprint(FD_IO, "rbd-engine: image size: %lu\n", info.size);
+	dprint(FD_IO, "rbd-engine: image size: %" PRIu64 "\n", info.size);
 
 	/* taken from "net" engine. Pretend we deal with files,
 	 * even if we do not have any ideas about files.
@@ -623,13 +614,8 @@ static int fio_rbd_setup(struct thread_data *td)
 	f = td->files[0];
 	f->real_file_size = info.size;
 
-	/* disconnect, then we were only connected to determine
-	 * the size of the RBD.
-	 */
 	return 0;
 
-disconnect:
-	_fio_rbd_disconnect(rbd);
 cleanup:
 	fio_rbd_cleanup(td);
 	return r;

@@ -1,10 +1,12 @@
 #ifndef FIO_IOLOG_H
 #define FIO_IOLOG_H
 
+#include <stdio.h>
+
 #include "lib/rbtree.h"
 #include "lib/ieee754.h"
 #include "flist.h"
-#include "ioengine.h"
+#include "ioengines.h"
 
 /*
  * Use for maintaining statistics
@@ -117,7 +119,7 @@ struct io_log {
 	 */
 	struct io_stat avg_window[DDIR_RWDIR_CNT];
 	unsigned long avg_msec;
-	unsigned long avg_last;
+	unsigned long avg_last[DDIR_RWDIR_CNT];
 
 	/*
 	 * Windowed latency histograms, for keeping track of when we need to
@@ -131,6 +133,11 @@ struct io_log {
 	pthread_mutex_t chunk_lock;
 	unsigned int chunk_seq;
 	struct flist_head chunk_list;
+
+	pthread_mutex_t deferred_free_lock;
+#define IOLOG_MAX_DEFER	8
+	void *deferred_items[IOLOG_MAX_DEFER];
+	unsigned int deferred;
 };
 
 /*
@@ -194,7 +201,7 @@ enum {
  */
 struct io_piece {
 	union {
-		struct rb_node rb_node;
+		struct fio_rb_node rb_node;
 		struct flist_head list;
 	};
 	struct flist_head trim_list;
@@ -259,7 +266,7 @@ struct log_params {
 
 static inline bool per_unit_log(struct io_log *log)
 {
-	return log && !log->avg_msec;
+	return log && (!log->avg_msec || log->log_gz || log->log_gz_store);
 }
 
 static inline bool inline_log(struct io_log *log)
@@ -271,7 +278,7 @@ static inline bool inline_log(struct io_log *log)
 
 static inline void ipo_bytes_align(unsigned int replay_align, struct io_piece *ipo)
 {
-	if (replay_align)
+	if (!replay_align)
 		return;
 
 	ipo->offset &= ~(replay_align - (uint64_t)1);
@@ -281,7 +288,7 @@ extern void finalize_logs(struct thread_data *td, bool);
 extern void setup_log(struct io_log **, struct log_params *, const char *);
 extern void flush_log(struct io_log *, bool);
 extern void flush_samples(FILE *, void *, uint64_t);
-extern unsigned long hist_sum(int, int, unsigned int *, unsigned int *);
+extern uint64_t hist_sum(int, int, uint64_t *, uint64_t *);
 extern void free_log(struct io_log *);
 extern void fio_writeout_logs(bool);
 extern void td_writeout_logs(struct thread_data *, bool);

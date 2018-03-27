@@ -1,7 +1,14 @@
+#ifdef CONFIG_VALGRIND_DEV
+#include <valgrind/drd.h>
+#else
+#define DRD_IGNORE_VAR(x) do { } while (0)
+#endif
+
 #include "fio.h"
 #include "smalloc.h"
 #include "helper_thread.h"
 #include "steadystate.h"
+#include "pshared.h"
 
 static struct helper_data {
 	volatile int exit;
@@ -11,7 +18,7 @@ static struct helper_data {
 	pthread_t thread;
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
-	struct fio_mutex *startup_mutex;
+	struct fio_sem *startup_sem;
 } *helper_data;
 
 void helper_thread_destroy(void)
@@ -71,45 +78,45 @@ static void *helper_thread_main(void *data)
 {
 	struct helper_data *hd = data;
 	unsigned int msec_to_next_event, next_log, next_ss = STEADYSTATE_MSEC;
-	struct timeval tv, last_du, last_ss;
+	struct timeval tv;
+	struct timespec ts, last_du, last_ss;
 	int ret = 0;
 
 	sk_out_assign(hd->sk_out);
 
 	gettimeofday(&tv, NULL);
-	memcpy(&last_du, &tv, sizeof(tv));
-	memcpy(&last_ss, &tv, sizeof(tv));
+	ts.tv_sec = tv.tv_sec;
+	ts.tv_nsec = tv.tv_usec * 1000;
+	memcpy(&last_du, &ts, sizeof(ts));
+	memcpy(&last_ss, &ts, sizeof(ts));
 
-	fio_mutex_up(hd->startup_mutex);
+	fio_sem_up(hd->startup_sem);
 
 	msec_to_next_event = DISK_UTIL_MSEC;
 	while (!ret && !hd->exit) {
-		struct timespec ts;
-		struct timeval now;
 		uint64_t since_du, since_ss = 0;
 
-		timeval_add_msec(&tv, msec_to_next_event);
-		ts.tv_sec = tv.tv_sec;
-		ts.tv_nsec = tv.tv_usec * 1000;
+		timespec_add_msec(&ts, msec_to_next_event);
 
 		pthread_mutex_lock(&hd->lock);
 		pthread_cond_timedwait(&hd->cond, &hd->lock, &ts);
 
-		gettimeofday(&now, NULL);
+		gettimeofday(&tv, NULL);
+		ts.tv_sec = tv.tv_sec;
+		ts.tv_nsec = tv.tv_usec * 1000;
 
 		if (hd->reset) {
-			memcpy(&tv, &now, sizeof(tv));
-			memcpy(&last_du, &now, sizeof(last_du));
-			memcpy(&last_ss, &now, sizeof(last_ss));
+			memcpy(&last_du, &ts, sizeof(ts));
+			memcpy(&last_ss, &ts, sizeof(ts));
 			hd->reset = 0;
 		}
 
 		pthread_mutex_unlock(&hd->lock);
 
-		since_du = mtime_since(&last_du, &now);
+		since_du = mtime_since(&last_du, &ts);
 		if (since_du >= DISK_UTIL_MSEC || DISK_UTIL_MSEC - since_du < 10) {
 			ret = update_io_ticks();
-			timeval_add_msec(&last_du, DISK_UTIL_MSEC);
+			timespec_add_msec(&last_du, DISK_UTIL_MSEC);
 			msec_to_next_event = DISK_UTIL_MSEC;
 			if (since_du >= DISK_UTIL_MSEC)
 				msec_to_next_event -= (since_du - DISK_UTIL_MSEC);
@@ -126,16 +133,15 @@ static void *helper_thread_main(void *data)
 			next_log = DISK_UTIL_MSEC;
 
 		if (steadystate_enabled) {
-			since_ss = mtime_since(&last_ss, &now);
+			since_ss = mtime_since(&last_ss, &ts);
 			if (since_ss >= STEADYSTATE_MSEC || STEADYSTATE_MSEC - since_ss < 10) {
 				steadystate_check();
-				timeval_add_msec(&last_ss, since_ss);
+				timespec_add_msec(&last_ss, since_ss);
 				if (since_ss > STEADYSTATE_MSEC)
 					next_ss = STEADYSTATE_MSEC - (since_ss - STEADYSTATE_MSEC);
 				else
 					next_ss = STEADYSTATE_MSEC;
-			}
-			else
+			} else
 				next_ss = STEADYSTATE_MSEC - since_ss;
                 }
 
@@ -152,12 +158,12 @@ static void *helper_thread_main(void *data)
 	return NULL;
 }
 
-int helper_thread_create(struct fio_mutex *startup_mutex, struct sk_out *sk_out)
+int helper_thread_create(struct fio_sem *startup_sem, struct sk_out *sk_out)
 {
 	struct helper_data *hd;
 	int ret;
 
-	hd = smalloc(sizeof(*hd));
+	hd = scalloc(1, sizeof(*hd));
 
 	setup_disk_util();
 	steadystate_setup();
@@ -168,7 +174,9 @@ int helper_thread_create(struct fio_mutex *startup_mutex, struct sk_out *sk_out)
 	if (ret)
 		return 1;
 
-	hd->startup_mutex = startup_mutex;
+	hd->startup_sem = startup_sem;
+
+	DRD_IGNORE_VAR(helper_data);
 
 	ret = pthread_create(&hd->thread, NULL, helper_thread_main, hd);
 	if (ret) {
@@ -178,8 +186,8 @@ int helper_thread_create(struct fio_mutex *startup_mutex, struct sk_out *sk_out)
 
 	helper_data = hd;
 
-	dprint(FD_MUTEX, "wait on startup_mutex\n");
-	fio_mutex_down(startup_mutex);
-	dprint(FD_MUTEX, "done waiting on startup_mutex\n");
+	dprint(FD_MUTEX, "wait on startup_sem\n");
+	fio_sem_down(startup_sem);
+	dprint(FD_MUTEX, "done waiting on startup_sem\n");
 	return 0;
 }

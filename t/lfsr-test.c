@@ -1,11 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 #include <math.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 
 #include "../lib/lfsr.h"
 #include "../gettime.h"
@@ -27,7 +23,7 @@ void usage()
 int main(int argc, char *argv[])
 {
 	int r;
-	struct timeval start, end;
+	struct timespec start, end;
 	struct fio_lfsr *fl;
 	int verify = 0;
 	unsigned int spin = 0;

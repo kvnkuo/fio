@@ -15,7 +15,7 @@
  */
 enum fio_filetype {
 	FIO_TYPE_FILE = 1,		/* plain file */
-	FIO_TYPE_BD,			/* block device */
+	FIO_TYPE_BLOCK,			/* block device */
 	FIO_TYPE_CHAR,			/* character device */
 	FIO_TYPE_PIPE,			/* pipe */
 };
@@ -63,6 +63,7 @@ enum fio_fallocate_mode {
 	FIO_FALLOCATE_NONE	= 1,
 	FIO_FALLOCATE_POSIX	= 2,
 	FIO_FALLOCATE_KEEP_SIZE	= 3,
+	FIO_FALLOCATE_NATIVE	= 4,
 };
 
 /*
@@ -90,6 +91,7 @@ struct fio_file {
 
 	/*
 	 * size of the file, offset into file, and io size from that offset
+	 * (be aware io_size is different from thread_options::io_size)
 	 */
 	uint64_t real_file_size;
 	uint64_t file_offset;
@@ -112,15 +114,18 @@ struct fio_file {
 	unsigned int last_write_idx;
 
 	/*
-	 * For use by the io engine
+	 * For use by the io engine for offset or private data storage
 	 */
-	uint64_t engine_data;
+	union {
+		uint64_t engine_pos;
+		void *engine_data;
+	};
 
 	/*
 	 * if io is protected by a semaphore, this is set
 	 */
 	union {
-		struct fio_mutex *lock;
+		struct fio_sem *lock;
 		struct fio_rwlock *rwlock;
 	};
 
@@ -146,14 +151,8 @@ struct fio_file {
 	struct disk_util *du;
 };
 
-#define FILE_ENG_DATA(f)	((void *) (uintptr_t) (f)->engine_data)
-#define FILE_SET_ENG_DATA(f, data)	\
-	((f)->engine_data = (uintptr_t) (data))
-
-struct file_name {
-	struct flist_head list;
-	char *filename;
-};
+#define FILE_ENG_DATA(f)		((f)->engine_data)
+#define FILE_SET_ENG_DATA(f, data)	((f)->engine_data = (data))
 
 #define FILE_FLAG_FNS(name)						\
 static inline void fio_file_set_##name(struct fio_file *f)		\
@@ -189,11 +188,17 @@ extern void close_and_free_files(struct thread_data *);
 extern uint64_t get_start_offset(struct thread_data *, struct fio_file *);
 extern int __must_check setup_files(struct thread_data *);
 extern int __must_check file_invalidate_cache(struct thread_data *, struct fio_file *);
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern int __must_check generic_open_file(struct thread_data *, struct fio_file *);
 extern int __must_check generic_close_file(struct thread_data *, struct fio_file *);
 extern int __must_check generic_get_file_size(struct thread_data *, struct fio_file *);
+#ifdef __cplusplus
+}
+#endif
 extern int __must_check file_lookup_open(struct fio_file *f, int flags);
-extern int __must_check pre_read_files(struct thread_data *);
+extern bool __must_check pre_read_files(struct thread_data *);
 extern unsigned long long get_rand_file_size(struct thread_data *td);
 extern int add_file(struct thread_data *, const char *, int, int);
 extern int add_file_exclusive(struct thread_data *, const char *);
@@ -204,7 +209,7 @@ extern void lock_file(struct thread_data *, struct fio_file *, enum fio_ddir);
 extern void unlock_file(struct thread_data *, struct fio_file *);
 extern void unlock_file_all(struct thread_data *, struct fio_file *);
 extern int add_dir_files(struct thread_data *, const char *);
-extern int init_random_map(struct thread_data *);
+extern bool init_random_map(struct thread_data *);
 extern void dup_files(struct thread_data *, struct thread_data *);
 extern int get_fileno(struct thread_data *, const char *);
 extern void free_release_files(struct thread_data *);
@@ -212,5 +217,6 @@ extern void filesetup_mem_free(void);
 extern void fio_file_reset(struct thread_data *, struct fio_file *);
 extern bool fio_files_done(struct thread_data *);
 extern bool exists_and_not_regfile(const char *);
+extern int fio_set_directio(struct thread_data *, struct fio_file *);
 
 #endif

@@ -9,11 +9,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/uio.h>
 #include <errno.h>
-#include <assert.h>
 #include <fcntl.h>
 
 #include "../fio.h"
@@ -172,8 +168,13 @@ static int fio_e4defrag_queue(struct thread_data *td, struct io_u *io_u)
 		len = io_u->xfer_buflen;
 
 	if (len != io_u->xfer_buflen) {
-		io_u->resid = io_u->xfer_buflen - len;
-		io_u->error = 0;
+		if (len) {
+			io_u->resid = io_u->xfer_buflen - len;
+			io_u->error = 0;
+		} else {
+			/* access beyond i_size */
+			io_u->error = EINVAL;
+		}
 	}
 	if (ret)
 		io_u->error = errno;

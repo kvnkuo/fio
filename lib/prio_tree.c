@@ -11,10 +11,14 @@
  * 02Feb2004	Initial version
  */
 
+#include <assert.h>
 #include <stdlib.h>
 #include <limits.h>
-#include "../fio.h"
+
+#include "../compiler/compiler.h"
 #include "prio_tree.h"
+
+#define ARRAY_SIZE(x)    (sizeof((x)) / (sizeof((x)[0])))
 
 /*
  * A clever mix of heap and radix trees forms a radix priority search tree (PST)

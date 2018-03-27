@@ -17,6 +17,7 @@
 #include "../log.h"
 #include "../lib/hweight.h"
 #include "../oslib/strcasestr.h"
+#include "../lib/types.h"
 
 #include "windows/posix.h"
 
@@ -37,7 +38,7 @@ int rand_r(unsigned *);
 
 #define FIO_PREFERRED_ENGINE		"windowsaio"
 #define FIO_PREFERRED_CLOCK_SOURCE	CS_CGETTIME
-#define FIO_OS_PATH_SEPARATOR		"\\"
+#define FIO_OS_PATH_SEPARATOR		'\\'
 
 #define FIO_MAX_CPUS	MAXIMUM_PROCESSORS
 
@@ -116,7 +117,6 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp);
 ssize_t pread(int fildes, void *buf, size_t nbyte, off_t offset);
 ssize_t pwrite(int fildes, const void *buf, size_t nbyte,
 		off_t offset);
-extern void td_fill_rand_seeds(struct thread_data *);
 
 static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
 {
@@ -152,9 +152,7 @@ static inline int chardev_size(struct fio_file *f, unsigned long long *bytes)
 
 static inline int blockdev_invalidate_cache(struct fio_file *f)
 {
-	/* There's no way to invalidate the cache in Windows
-	 * so just pretend to succeed */
-	return 0;
+	return ENOTSUP;
 }
 
 static inline unsigned long long os_phys_mem(void)
@@ -212,17 +210,17 @@ static inline int fio_getaffinity(int pid, os_cpu_mask_t *mask)
 
 static inline void fio_cpu_clear(os_cpu_mask_t *mask, int cpu)
 {
-	*mask ^= 1 << (cpu-1);
+	*mask &= ~(1ULL << cpu);
 }
 
 static inline void fio_cpu_set(os_cpu_mask_t *mask, int cpu)
 {
-	*mask |= 1 << cpu;
+	*mask |= 1ULL << cpu;
 }
 
 static inline int fio_cpu_isset(os_cpu_mask_t *mask, int cpu)
 {
-	return (*mask & (1U << cpu));
+	return (*mask & (1ULL << cpu)) != 0;
 }
 
 static inline int fio_cpu_count(os_cpu_mask_t *mask)
@@ -241,7 +239,7 @@ static inline int fio_cpuset_exit(os_cpu_mask_t *mask)
 	return 0;
 }
 
-static inline int init_random_state(struct thread_data *td, unsigned long *rand_seeds, int size)
+static inline int init_random_seeds(unsigned long *rand_seeds, int size)
 {
 	HCRYPTPROV hCryptProv;
 
@@ -260,7 +258,6 @@ static inline int init_random_state(struct thread_data *td, unsigned long *rand_
 	}
 
 	CryptReleaseContext(hCryptProv, 0);
-	td_fill_rand_seeds(td);
 	return 0;
 }
 

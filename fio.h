@@ -20,14 +20,14 @@
 #include "fifo.h"
 #include "arch/arch.h"
 #include "os/os.h"
-#include "mutex.h"
 #include "log.h"
 #include "debug.h"
 #include "file.h"
 #include "io_ddir.h"
-#include "ioengine.h"
+#include "ioengines.h"
 #include "iolog.h"
 #include "helpers.h"
+#include "minmax.h"
 #include "options.h"
 #include "profile.h"
 #include "fio_time.h"
@@ -35,10 +35,12 @@
 #include "oslib/getopt.h"
 #include "lib/rand.h"
 #include "lib/rbtree.h"
+#include "lib/num2str.h"
 #include "client.h"
 #include "server.h"
 #include "stat.h"
 #include "flow.h"
+#include "io_u.h"
 #include "io_u_queue.h"
 #include "workqueue.h"
 #include "steadystate.h"
@@ -57,6 +59,12 @@
 #define MPOL_LOCAL MPOL_MAX
 #endif
 
+#ifdef CONFIG_CUDA
+#include <cuda.h>
+#endif
+
+struct fio_sem;
+
 /*
  * offset generator types
  */
@@ -66,25 +74,50 @@ enum {
 };
 
 enum {
-	TD_F_VER_BACKLOG	= 1U << 0,
-	TD_F_TRIM_BACKLOG	= 1U << 1,
-	TD_F_READ_IOLOG		= 1U << 2,
-	TD_F_REFILL_BUFFERS	= 1U << 3,
-	TD_F_SCRAMBLE_BUFFERS	= 1U << 4,
-	TD_F_VER_NONE		= 1U << 5,
-	TD_F_PROFILE_OPS	= 1U << 6,
-	TD_F_COMPRESS		= 1U << 7,
-	TD_F_NOIO		= 1U << 8,
-	TD_F_COMPRESS_LOG	= 1U << 9,
-	TD_F_VSTATE_SAVED	= 1U << 10,
-	TD_F_NEED_LOCK		= 1U << 11,
-	TD_F_CHILD		= 1U << 12,
-	TD_F_NO_PROGRESS        = 1U << 13,
-	TD_F_REGROW_LOGS	= 1U << 14,
+	__TD_F_VER_BACKLOG	= 0,
+	__TD_F_TRIM_BACKLOG,
+	__TD_F_READ_IOLOG,
+	__TD_F_REFILL_BUFFERS,
+	__TD_F_SCRAMBLE_BUFFERS,
+	__TD_F_VER_NONE,
+	__TD_F_PROFILE_OPS,
+	__TD_F_COMPRESS,
+	__TD_F_COMPRESS_LOG,
+	__TD_F_VSTATE_SAVED,
+	__TD_F_NEED_LOCK,
+	__TD_F_CHILD,
+	__TD_F_NO_PROGRESS,
+	__TD_F_REGROW_LOGS,
+	__TD_F_MMAP_KEEP,
+	__TD_F_DIRS_CREATED,
+	__TD_F_CHECK_RATE,
+	__TD_F_LAST,		/* not a real bit, keep last */
+};
+
+enum {
+	TD_F_VER_BACKLOG	= 1U << __TD_F_VER_BACKLOG,
+	TD_F_TRIM_BACKLOG	= 1U << __TD_F_TRIM_BACKLOG,
+	TD_F_READ_IOLOG		= 1U << __TD_F_READ_IOLOG,
+	TD_F_REFILL_BUFFERS	= 1U << __TD_F_REFILL_BUFFERS,
+	TD_F_SCRAMBLE_BUFFERS	= 1U << __TD_F_SCRAMBLE_BUFFERS,
+	TD_F_VER_NONE		= 1U << __TD_F_VER_NONE,
+	TD_F_PROFILE_OPS	= 1U << __TD_F_PROFILE_OPS,
+	TD_F_COMPRESS		= 1U << __TD_F_COMPRESS,
+	TD_F_COMPRESS_LOG	= 1U << __TD_F_COMPRESS_LOG,
+	TD_F_VSTATE_SAVED	= 1U << __TD_F_VSTATE_SAVED,
+	TD_F_NEED_LOCK		= 1U << __TD_F_NEED_LOCK,
+	TD_F_CHILD		= 1U << __TD_F_CHILD,
+	TD_F_NO_PROGRESS        = 1U << __TD_F_NO_PROGRESS,
+	TD_F_REGROW_LOGS	= 1U << __TD_F_REGROW_LOGS,
+	TD_F_MMAP_KEEP		= 1U << __TD_F_MMAP_KEEP,
+	TD_F_DIRS_CREATED	= 1U << __TD_F_DIRS_CREATED,
+	TD_F_CHECK_RATE		= 1U << __TD_F_CHECK_RATE,
 };
 
 enum {
 	FIO_RAND_BS_OFF		= 0,
+	FIO_RAND_BS1_OFF,
+	FIO_RAND_BS2_OFF,
 	FIO_RAND_VER_OFF,
 	FIO_RAND_MIX_OFF,
 	FIO_RAND_FILE_OFF,
@@ -99,6 +132,8 @@ enum {
 	FIO_DEDUPE_OFF,
 	FIO_RAND_POISSON_OFF,
 	FIO_RAND_ZONE_OFF,
+	FIO_RAND_POISSON2_OFF,
+	FIO_RAND_POISSON3_OFF,
 	FIO_RAND_NR_OFFS,
 };
 
@@ -121,13 +156,14 @@ enum {
  * Per-thread/process specific data. Only used for the network client
  * for now.
  */
-struct sk_out;
 void sk_out_assign(struct sk_out *);
 void sk_out_drop(void);
 
 struct zone_split_index {
 	uint8_t size_perc;
 	uint8_t size_perc_prev;
+	uint64_t size;
+	uint64_t size_prev;
 };
 
 /*
@@ -142,7 +178,7 @@ struct thread_data {
 	unsigned int thread_number;
 	unsigned int subjob_number;
 	unsigned int groupid;
-	struct thread_stat ts;
+	struct thread_stat ts __attribute__ ((aligned(8)));
 
 	int client_type;
 
@@ -158,13 +194,13 @@ struct thread_data {
 	struct thread_data *parent;
 
 	uint64_t stat_io_bytes[DDIR_RWDIR_CNT];
-	struct timeval bw_sample_time;
+	struct timespec bw_sample_time;
 
 	uint64_t stat_io_blocks[DDIR_RWDIR_CNT];
-	struct timeval iops_sample_time;
+	struct timespec iops_sample_time;
 
 	volatile int update_rusage;
-	struct fio_mutex *rusage_sem;
+	struct fio_sem *rusage_sem;
 	struct rusage ru_start;
 	struct rusage ru_end;
 
@@ -174,7 +210,6 @@ struct thread_data {
 	unsigned int files_index;
 	unsigned int nr_open_files;
 	unsigned int nr_done_files;
-	unsigned int nr_normal_files;
 	union {
 		unsigned int next_file;
 		struct frand_state next_file_state;
@@ -195,9 +230,9 @@ struct thread_data {
 	pid_t pid;
 	char *orig_buffer;
 	size_t orig_buffer_size;
-	volatile int terminate;
 	volatile int runstate;
-	unsigned int last_was_sync;
+	volatile bool terminate;
+	bool last_was_sync;
 	enum fio_ddir last_ddir;
 
 	int mmapfd;
@@ -205,11 +240,9 @@ struct thread_data {
 	void *iolog_buf;
 	FILE *iolog_f;
 
-	char *sysfs_root;
-
 	unsigned long rand_seeds[FIO_RAND_NR_OFFS];
 
-	struct frand_state bsrange_state;
+	struct frand_state bsrange_state[DDIR_RWDIR_CNT];
 	struct frand_state verify_state;
 	struct frand_state trim_state;
 	struct frand_state delay_state;
@@ -233,6 +266,7 @@ struct thread_data {
 	 * to any of the available IO engines.
 	 */
 	struct ioengine_ops *io_ops;
+	int io_ops_init;
 
 	/*
 	 * IO engine private data and dlhandle.
@@ -281,9 +315,9 @@ struct thread_data {
 	unsigned long rate_bytes[DDIR_RWDIR_CNT];
 	unsigned long rate_blocks[DDIR_RWDIR_CNT];
 	unsigned long long rate_io_issue_bytes[DDIR_RWDIR_CNT];
-	struct timeval lastrate[DDIR_RWDIR_CNT];
-	int64_t last_usec;
-	struct frand_state poisson_state;
+	struct timespec lastrate[DDIR_RWDIR_CNT];
+	int64_t last_usec[DDIR_RWDIR_CNT];
+	struct frand_state poisson_state[DDIR_RWDIR_CNT];
 
 	/*
 	 * Enforced rate submission/completion workqueue
@@ -309,7 +343,7 @@ struct thread_data {
 	uint64_t this_io_bytes[DDIR_RWDIR_CNT];
 	uint64_t io_skip_bytes;
 	uint64_t zone_bytes;
-	struct fio_mutex *mutex;
+	struct fio_sem *sem;
 	uint64_t bytes_done[DDIR_RWDIR_CNT];
 
 	/*
@@ -317,21 +351,21 @@ struct thread_data {
 	 */
 	struct frand_state random_state;
 
-	struct timeval start;	/* start of this loop */
-	struct timeval epoch;	/* time job was started */
+	struct timespec start;	/* start of this loop */
+	struct timespec epoch;	/* time job was started */
 	unsigned long long unix_epoch; /* Time job was started, unix epoch based. */
-	struct timeval last_issue;
+	struct timespec last_issue;
 	long time_offset;
-	struct timeval tv_cache;
-	struct timeval terminate_time;
-	unsigned int tv_cache_nr;
-	unsigned int tv_cache_mask;
-	unsigned int ramp_time_over;
+	struct timespec ts_cache;
+	struct timespec terminate_time;
+	unsigned int ts_cache_nr;
+	unsigned int ts_cache_mask;
+	bool ramp_time_over;
 
 	/*
 	 * Time since last latency_window was started
 	 */
-	struct timeval latency_ts;
+	struct timespec latency_ts;
 	unsigned int latency_qd;
 	unsigned int latency_qd_high;
 	unsigned int latency_qd_low;
@@ -406,6 +440,18 @@ struct thread_data {
 	struct steadystate_data ss;
 
 	char verror[FIO_VERROR_SIZE];
+
+#ifdef CONFIG_CUDA
+	/*
+	 * for GPU memory management
+	 */
+	int gpu_dev_cnt;
+	int gpu_dev_id;
+	CUdevice  cu_dev;
+	CUcontext cu_ctx;
+	CUdeviceptr dev_mem_ptr;
+#endif	
+
 };
 
 /*
@@ -461,6 +507,7 @@ extern uintptr_t page_mask, page_size;
 extern int read_only;
 extern int eta_print;
 extern int eta_new_line;
+extern unsigned int eta_interval_msec;
 extern unsigned long done_secs;
 extern int fio_gtod_offload;
 extern int fio_gtod_cpu;
@@ -481,6 +528,8 @@ extern char *aux_path;
 
 extern struct thread_data *threads;
 
+extern bool eta_time_within_slack(unsigned int time);
+
 static inline void fio_ro_check(const struct thread_data *td, struct io_u *io_u)
 {
 	assert(!(io_u->ddir == DDIR_WRITE && !td_write(td)));
@@ -492,7 +541,7 @@ static inline int should_fsync(struct thread_data *td)
 {
 	if (td->last_was_sync)
 		return 0;
-	if (td_write(td) || td_rw(td) || td->o.override_sync)
+	if (td_write(td) || td->o.override_sync)
 		return 1;
 
 	return 0;
@@ -518,11 +567,9 @@ extern int fio_show_option_help(const char *);
 extern void fio_options_set_ioengine_opts(struct option *long_options, struct thread_data *td);
 extern void fio_options_dup_and_init(struct option *);
 extern void fio_options_mem_dupe(struct thread_data *);
-extern void options_mem_dupe(void *data, struct fio_option *options);
 extern void td_fill_rand_seeds(struct thread_data *);
 extern void td_fill_verify_state_seed(struct thread_data *);
 extern void add_job_opts(const char **, int);
-extern char *num2str(uint64_t, int, int, int, int);
 extern int ioengine_load(struct thread_data *);
 extern bool parse_dryrun(void);
 extern int fio_running_or_pending_io_threads(void);
@@ -534,13 +581,6 @@ extern uintptr_t page_mask;
 extern uintptr_t page_size;
 extern int initialize_fio(char *envp[]);
 extern void deinitialize_fio(void);
-
-#define N2S_NONE	0
-#define N2S_BITPERSEC 	1	/* match unit_base for bit rates */
-#define N2S_PERSEC	2
-#define N2S_BIT		3
-#define N2S_BYTE	4
-#define N2S_BYTEPERSEC 	8	/* match unit_base for byte rates */
 
 #define FIO_GETOPT_JOB		0x89000000
 #define FIO_GETOPT_IOENGINE	0x98000000
@@ -576,18 +616,13 @@ enum {
 	TD_NR,
 };
 
-#define TD_ENG_FLAG_SHIFT	16
-#define TD_ENG_FLAG_MASK	((1U << 16) - 1)
-
-static inline enum fio_ioengine_flags td_ioengine_flags(struct thread_data *td)
-{
-	return (enum fio_ioengine_flags)
-		((td->flags >> TD_ENG_FLAG_SHIFT) & TD_ENG_FLAG_MASK);
-}
+#define TD_ENG_FLAG_SHIFT	17
+#define TD_ENG_FLAG_MASK	((1U << 17) - 1)
 
 static inline void td_set_ioengine_flags(struct thread_data *td)
 {
-	td->flags |= (td->io_ops->flags << TD_ENG_FLAG_SHIFT);
+	td->flags = (~(TD_ENG_FLAG_MASK << TD_ENG_FLAG_SHIFT) & td->flags) |
+		    (td->io_ops->flags << TD_ENG_FLAG_SHIFT);
 }
 
 static inline bool td_ioengine_flagged(struct thread_data *td,
@@ -620,22 +655,19 @@ extern int __must_check allocate_io_mem(struct thread_data *);
 extern void free_io_mem(struct thread_data *);
 extern void free_threads_shm(void);
 
+#ifdef FIO_INTERNAL
+#define PTR_ALIGN(ptr, mask)	\
+	(char *) (((uintptr_t) (ptr) + (mask)) & ~(mask))
+#endif
+
 /*
  * Reset stats after ramp time completes
  */
 extern void reset_all_stats(struct thread_data *);
 
-/*
- * blktrace support
- */
-#ifdef FIO_HAVE_BLKTRACE
-extern int is_blktrace(const char *, int *);
-extern int load_blktrace(struct thread_data *, const char *, int);
-#endif
-
 extern int io_queue_event(struct thread_data *td, struct io_u *io_u, int *ret,
 		   enum fio_ddir ddir, uint64_t *bytes_issued, int from_verify,
-		   struct timeval *comp_time);
+		   struct timespec *comp_time);
 
 /*
  * Latency target helpers
@@ -644,6 +676,9 @@ extern void lat_target_check(struct thread_data *);
 extern void lat_target_init(struct thread_data *);
 extern void lat_target_reset(struct thread_data *);
 
+/*
+ * Iterates all threads/processes within all the defined jobs
+ */
 #define for_each_td(td, i)	\
 	for ((i) = 0, (td) = &threads[0]; (i) < (int) thread_number; (i)++, (td)++)
 #define for_each_file(td, f, i)	\
@@ -671,8 +706,7 @@ static inline bool fio_fill_issue_time(struct thread_data *td)
 	return false;
 }
 
-static inline bool __should_check_rate(struct thread_data *td,
-				       enum fio_ddir ddir)
+static inline bool option_check_rate(struct thread_data *td, enum fio_ddir ddir)
 {
 	struct thread_options *o = &td->o;
 
@@ -686,13 +720,19 @@ static inline bool __should_check_rate(struct thread_data *td,
 	return false;
 }
 
+static inline bool __should_check_rate(struct thread_data *td,
+				       enum fio_ddir ddir)
+{
+	return (td->flags & TD_F_CHECK_RATE) != 0;
+}
+
 static inline bool should_check_rate(struct thread_data *td)
 {
-	if (td->bytes_done[DDIR_READ] && __should_check_rate(td, DDIR_READ))
+	if (__should_check_rate(td, DDIR_READ) && td->bytes_done[DDIR_READ])
 		return true;
-	if (td->bytes_done[DDIR_WRITE] && __should_check_rate(td, DDIR_WRITE))
+	if (__should_check_rate(td, DDIR_WRITE) && td->bytes_done[DDIR_WRITE])
 		return true;
-	if (td->bytes_done[DDIR_TRIM] && __should_check_rate(td, DDIR_TRIM))
+	if (__should_check_rate(td, DDIR_TRIM) && td->bytes_done[DDIR_TRIM])
 		return true;
 
 	return false;
@@ -762,11 +802,6 @@ static inline void td_flags_set(struct thread_data *td, unsigned int *flags,
 extern const char *fio_get_arch_string(int);
 extern const char *fio_get_os_string(int);
 
-#ifdef FIO_INTERNAL
-#define ARRAY_SIZE(x)    (sizeof((x)) / (sizeof((x)[0])))
-#define FIELD_SIZE(s, f) (sizeof(((typeof(s))0)->f))
-#endif
-
 enum {
 	__FIO_OUTPUT_TERSE	= 0,
 	__FIO_OUTPUT_JSON	= 1,
@@ -786,6 +821,7 @@ enum {
 	FIO_RAND_DIST_PARETO,
 	FIO_RAND_DIST_GAUSS,
 	FIO_RAND_DIST_ZONED,
+	FIO_RAND_DIST_ZONED_ABS,
 };
 
 #define FIO_DEF_ZIPF		1.1

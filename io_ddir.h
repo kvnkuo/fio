@@ -5,13 +5,15 @@ enum fio_ddir {
 	DDIR_READ = 0,
 	DDIR_WRITE = 1,
 	DDIR_TRIM = 2,
-	DDIR_RWDIR_CNT = 3,
 	DDIR_SYNC = 3,
 	DDIR_DATASYNC,
 	DDIR_SYNC_FILE_RANGE,
 	DDIR_WAIT,
 	DDIR_LAST,
 	DDIR_INVAL = -1,
+
+	DDIR_RWDIR_CNT = 3,
+	DDIR_RWDIR_SYNC_CNT = 4,
 };
 
 static inline const char *io_ddir_name(enum fio_ddir ddir)
@@ -61,9 +63,9 @@ static inline int ddir_rw(enum fio_ddir ddir)
 
 static inline const char *ddir_str(enum td_ddir ddir)
 {
-	static const char *__str[] = { NULL, "read", "write", "rw", NULL,
+	static const char *__str[] = { NULL, "read", "write", "rw", "rand",
 				"randread", "randwrite", "randrw",
-				"trim", NULL, NULL, NULL, "randtrim" };
+				"trim", NULL, "trimwrite", NULL, "randtrim" };
 
 	return __str[ddir];
 }

@@ -1,9 +1,7 @@
 #include <stdlib.h>
-#include <inttypes.h>
 
 #include "bloom.h"
 #include "../hash.h"
-#include "../minmax.h"
 #include "../crc/xxhash.h"
 #include "../crc/murmur3.h"
 #include "../crc/crc32c.h"
@@ -104,8 +102,10 @@ static bool __bloom_check(struct bloom *b, const void *data, unsigned int len,
 
 		if (b->map[index] & (1U << bit))
 			was_set++;
-		if (set)
+		else if (set)
 			b->map[index] |= 1U << bit;
+		else
+			break;
 	}
 
 	return was_set == N_HASHES;
